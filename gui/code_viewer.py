@@ -1,11 +1,15 @@
 """コードビューア
 
-QPlainTextEdit を継承した読み取り専用のビューア。
-  - 行番号エリア（差分表示用に任意のラベルも表示できる）
+QPlainTextEdit を継承したビューア（既定は読み取り専用）。
+  - 行番号エリア（差分表示用に任意のラベルも表示できる。文法チェックのエラー行には印を付ける）
   - 現在行の強調
   - QSyntaxHighlighter による C# ハイライト（キーワード・文字列・コメント・数値）
   - 検索バー（Ctrl+F、次へ F3 / 前へ Shift+F3、大文字小文字の区別、正規表現）
   - フォントサイズ変更（Ctrl+ホイール、Ctrl+0 で既定に戻す）
+  - 編集（set_editable(True) のときのみ。変更指示002）:
+    元に戻す / やり直し（Ctrl+Z / Ctrl+Y）、タブ文字はタブのまま入力、
+    複数行選択での Tab / Shift+Tab によるインデント増減、Enter で前行のインデントを引き継ぐ。
+    内部の改行は \\n に統一して扱う（plain_text()）。
 """
 
 from __future__ import annotations
@@ -212,8 +216,13 @@ class LineNumberArea(QWidget):
         self._editor.paint_line_numbers(event)
 
 
+MARKER_ERROR = "error"
+MARKER_WARNING = "warning"
+_MARKER_WIDTH = 10
+
+
 class CodeViewer(QPlainTextEdit):
-    """読み取り専用のコードビューア。"""
+    """コードビューア（既定は読み取り専用。set_editable(True) で編集可能）。"""
 
     font_size_changed = Signal(int)
 
@@ -226,12 +235,10 @@ class CodeViewer(QPlainTextEdit):
                  highlight: bool = True):
         super().__init__(parent)
         self.setObjectName("codeViewer")
-        self.setReadOnly(True)
-        # 読み取り専用でもキーボードでカーソル移動・選択できるようにする（現在行の強調に使う）
-        self.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-            | Qt.TextInteractionFlag.TextSelectableByKeyboard
-        )
+        self._editable = False
+        self._apply_read_only()
+        # Tab キーはフォーカス移動ではなくタブ文字の入力に使う
+        self.setTabChangesFocus(False)
         self.setTabStopDistance(4 * max(1, self.fontMetrics().horizontalAdvance(" ")))
         self.set_word_wrap(word_wrap)
 
@@ -243,6 +250,7 @@ class CodeViewer(QPlainTextEdit):
         self._line_area = LineNumberArea(self)
         self._line_labels: list[str] | None = None
         self._line_backgrounds: dict[int, QColor] = {}
+        self._line_markers: dict[int, str] = {}     # 行（0 始まり）→ MARKER_ERROR / MARKER_WARNING
         self._match_selections: list[QTextEdit.ExtraSelection] = []
 
         self.highlighter = CSharpHighlighter(self.document()) if highlight else None
@@ -255,13 +263,146 @@ class CodeViewer(QPlainTextEdit):
 
     # --- 表示内容 -------------------------------------------------------
     def set_code(self, text: str) -> None:
+        """内容を置き換える（元に戻す／やり直しの履歴は消える）。"""
         self._line_labels = None
         self._line_backgrounds = {}
+        self._line_markers = {}
         self._match_selections = []
         self.setPlainText(text or "")
+        self.document().setModified(False)
         self.moveCursor(QTextCursor.MoveOperation.Start)
         self._update_line_area_width()
         self._update_extra_selections()
+
+    def plain_text(self) -> str:
+        """内容（改行は \\n）。
+
+        toPlainText() は改行なしスペース（U+00A0）を通常の空白に変えてしまうため、
+        toRawText() を使い、段落区切り（U+2029）だけを \\n に戻す。
+        """
+        doc = self.document()
+        raw = getattr(doc, "toRawText", None)
+        text = raw() if raw is not None else doc.toPlainText()
+        return text.replace(" ", "\n")
+
+    # --- 編集 -------------------------------------------------------------
+    def is_editable(self) -> bool:
+        return self._editable
+
+    def set_editable(self, editable: bool) -> None:
+        editable = bool(editable)
+        if editable == self._editable:
+            return
+        self._editable = editable
+        self._apply_read_only()
+        self._update_extra_selections()
+
+    def _apply_read_only(self) -> None:
+        self.setReadOnly(not self._editable)
+        if self._editable:
+            self.setTextInteractionFlags(Qt.TextInteractionFlag.TextEditorInteraction)
+        else:
+            # 読み取り専用でもキーボードでカーソル移動・選択できるようにする（現在行の強調に使う）
+            self.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+
+    def keyPressEvent(self, event) -> None:
+        if self._editable and not self.isReadOnly():
+            key = event.key()
+            mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+            no_mods = mods == Qt.KeyboardModifier.NoModifier
+            shift_only = mods == Qt.KeyboardModifier.ShiftModifier
+            if key == Qt.Key.Key_Tab and no_mods and self._selection_spans_lines():
+                self._indent_selection()
+                event.accept()
+                return
+            if key == Qt.Key.Key_Backtab or (key == Qt.Key.Key_Tab and shift_only):
+                self._unindent_selection()
+                event.accept()
+                return
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and (no_mods or shift_only):
+                # Shift+Enter も通常の改行にする（行区切り U+2028 を入れない）
+                self._newline_with_indent()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def _selection_spans_lines(self) -> bool:
+        cur = self.textCursor()
+        if not cur.hasSelection():
+            return False
+        doc = self.document()
+        return (doc.findBlock(cur.selectionStart()).blockNumber()
+                != doc.findBlock(cur.selectionEnd()).blockNumber())
+
+    def _selected_block_range(self) -> tuple[int, int]:
+        """選択範囲（なければカーソル行）の (先頭行, 末尾行)。末尾が行頭ちょうどならその行は含めない。"""
+        cur = self.textCursor()
+        doc = self.document()
+        first = doc.findBlock(cur.selectionStart())
+        last = doc.findBlock(cur.selectionEnd())
+        if (cur.hasSelection() and last.blockNumber() > first.blockNumber()
+                and cur.selectionEnd() == last.position()):
+            last = last.previous()
+        return first.blockNumber(), last.blockNumber()
+
+    def _reselect_blocks(self, first_no: int, last_no: int) -> None:
+        doc = self.document()
+        first = doc.findBlockByNumber(first_no)
+        last = doc.findBlockByNumber(last_no)
+        cur = QTextCursor(first)
+        cur.setPosition(last.position() + len(last.text()), QTextCursor.MoveMode.KeepAnchor)
+        self.setTextCursor(cur)
+
+    def _indent_selection(self) -> None:
+        first_no, last_no = self._selected_block_range()
+        doc = self.document()
+        cur = QTextCursor(doc)
+        cur.beginEditBlock()
+        for n in range(first_no, last_no + 1):
+            block = doc.findBlockByNumber(n)
+            cur.setPosition(block.position())
+            cur.insertText("\t")
+        cur.endEditBlock()
+        self._reselect_blocks(first_no, last_no)
+
+    def _unindent_selection(self) -> None:
+        had_selection = self.textCursor().hasSelection() and self._selection_spans_lines()
+        first_no, last_no = self._selected_block_range()
+        doc = self.document()
+        cur = QTextCursor(doc)
+        cur.beginEditBlock()
+        for n in range(first_no, last_no + 1):
+            block = doc.findBlockByNumber(n)
+            text = block.text()
+            if text.startswith("\t"):
+                remove = 1
+            else:
+                remove = len(text) - len(text.lstrip(" "))
+                remove = min(remove, 4)
+            if remove:
+                cur.setPosition(block.position())
+                cur.setPosition(block.position() + remove, QTextCursor.MoveMode.KeepAnchor)
+                cur.removeSelectedText()
+        cur.endEditBlock()
+        if had_selection:
+            self._reselect_blocks(first_no, last_no)
+
+    def _newline_with_indent(self) -> None:
+        cur = self.textCursor()
+        block = cur.block()
+        text = block.text()
+        indent_len = len(text) - len(text.lstrip(" \t"))
+        # カーソルが行頭の空白の途中にある場合は、カーソルより左の空白だけを引き継ぐ
+        col = cur.position() - block.position()
+        indent = text[:min(indent_len, col)]
+        cur.beginEditBlock()
+        cur.insertText("\n" + indent)
+        cur.endEditBlock()
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
 
     def set_line_labels(self, labels: list[str] | None) -> None:
         """行番号の代わりに表示するラベル（差分表示で使う。None で通常の行番号）。"""
@@ -272,6 +413,15 @@ class CodeViewer(QPlainTextEdit):
     def set_line_backgrounds(self, backgrounds: dict[int, QColor]) -> None:
         """行（0 始まり）ごとの背景色。"""
         self._line_backgrounds = dict(backgrounds)
+        self._update_extra_selections()
+
+    def set_line_markers(self, markers: dict[int, str] | None) -> None:
+        """文法チェックの印（行は 0 始まり、値は MARKER_ERROR / MARKER_WARNING）。
+
+        行番号エリアに印を付け、行の背景をエラー色（警告色）にする。
+        """
+        self._line_markers = dict(markers or {})
+        self._update_line_area_width()
         self._update_extra_selections()
 
     def set_word_wrap(self, enabled: bool) -> None:
@@ -330,7 +480,8 @@ class CodeViewer(QPlainTextEdit):
         else:
             chars = len(str(max(1, self.blockCount())))
         chars = max(chars, 3)
-        return 12 + self.fontMetrics().horizontalAdvance("9") * chars
+        marker = _MARKER_WIDTH if self._line_markers else 0
+        return 12 + marker + self.fontMetrics().horizontalAdvance("9") * chars
 
     def _update_line_area_width(self, *args) -> None:
         self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
@@ -357,6 +508,10 @@ class CodeViewer(QPlainTextEdit):
         current_block = self.textCursor().blockNumber()
         width = self._line_area.width() - 6
         height = self.fontMetrics().height()
+        marker_colors = {
+            MARKER_ERROR: QColor(COLORS["code_error_marker"]),
+            MARKER_WARNING: QColor(COLORS["code_warning_marker"]),
+        }
 
         block = self.firstVisibleBlock()
         number = block.blockNumber()
@@ -368,6 +523,14 @@ class CodeViewer(QPlainTextEdit):
                     label = self._line_labels[number] if number < len(self._line_labels) else ""
                 else:
                     label = str(number + 1)
+                kind = self._line_markers.get(number)
+                if kind in marker_colors:
+                    # 行番号の左に丸印
+                    d = max(6, min(_MARKER_WIDTH - 2, height - 4))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(marker_colors[kind])
+                    painter.drawEllipse(3, top + (height - d) // 2, d, d)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.setPen(current_pen if number == current_block else normal_pen)
                 painter.drawText(0, top, width, height, Qt.AlignmentFlag.AlignRight, label)
             block = block.next()
@@ -399,6 +562,22 @@ class CodeViewer(QPlainTextEdit):
             cur.cursor = self.textCursor()
             cur.cursor.clearSelection()
             selections.append(cur)
+
+        # 文法チェックのエラー行（現在行の強調より後に置き、エラー色が見えるようにする）
+        line_colors = {
+            MARKER_ERROR: QColor(COLORS["code_error_line"]),
+            MARKER_WARNING: QColor(COLORS["code_warning_line"]),
+        }
+        for line, kind in self._line_markers.items():
+            color = line_colors.get(kind)
+            block = doc.findBlockByNumber(line)
+            if color is None or not block.isValid():
+                continue
+            sel = QTextEdit.ExtraSelection()
+            sel.format.setBackground(color)
+            sel.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+            sel.cursor = QTextCursor(block)
+            selections.append(sel)
 
         selections.extend(self._match_selections)
         self.setExtraSelections(selections)

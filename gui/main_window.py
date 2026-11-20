@@ -5,8 +5,10 @@
 ウィンドウは自由にリサイズ・最大化できる。
 
 - DB の読み取りはワーカースレッドで行い、進捗をステータスバーに表示する。
-- 起動時は閲覧モード。ツールバーの「編集モード」を ON にしたときだけ編集できる。
-- DB への書き込みは、すべて変更プレビュー（PreviewDialog）を通す。
+- 起動時は閲覧モード。ツールバーの「編集モード」を ON にしたときだけ編集できる
+  （ポイント設定と、スクリプトタブのソース。変更指示002）。
+- DB への書き込みは、すべて変更プレビュー（PreviewDialog / ScriptPreviewDialog）を通す。
+  スクリプトの保存では、プレビューの前に文法チェックを行う。
 
 外観スタイルは gui/styles.py の QSS に集約しており、本モジュールでは
 objectName の設定のみ行う。
@@ -48,8 +50,9 @@ from PySide6.QtWidgets import (
 )
 
 from core import APP_NAME, APP_TITLE, APP_VERSION
-from core.change_executor import validate_updated_by
+from core.change_executor import ScriptChange, validate_updated_by
 from core.check_service import CHECKS
+from core.compile_checker import STATUS_ERROR, STATUS_UNAVAILABLE, describe_compilers
 from core.config_manager import AUTH_SQL, ConfigManager, load_password
 from core.db import Database
 from core.import_export import (
@@ -67,6 +70,7 @@ from core.models import (
     yes_no,
 )
 from core.point_service import ChangeSet, build_change_set, plan_import
+from core.script_parser import ScriptRewriteError, build_script_xml, detect_source_newline
 from gui import worker
 from gui.all_points_view import AllPointsView
 from gui.check_dialog import CheckResultDialog
@@ -74,7 +78,7 @@ from gui.connection_dialog import ConnectionDialog
 from gui.datasource_tab import DataSourceTab
 from gui.diff_dialog import DiffDialog, SimilarGroupsDialog
 from gui.point_tab import EditSession, PointTab
-from gui.preview_dialog import PreviewDialog, show_error
+from gui.preview_dialog import PreviewDialog, ScriptPreviewDialog, show_error
 from gui.script_search_view import ScriptSearchView
 from gui.script_tab import ScriptTab, ScriptWindow, script_file_name, write_cs_file
 from gui.styles import COLORS, refresh_style
@@ -166,8 +170,10 @@ class MainWindow(QMainWindow):
         # スナップショットを読んだ接続先（保存はこの接続先と現在の設定が一致するときのみ）
         self._loading_conn = None
         self._snapshot_conn = None
-        # 保存に成功したが、まだ再読込できていない（表示が DB と食い違っている）
-        self._snapshot_stale = False
+        # 保存に成功したが、まだ再読込できていない（表示が DB と食い違っている）。
+        # ポイント設定とスクリプトで別々に持つ（一方を保存しても、他方の未保存の変更は保存できる）
+        self._points_stale = False
+        self._script_stale = False
 
         self.setWindowTitle(f"{APP_TITLE} ({APP_NAME})")
         self.resize(1400, 900)
@@ -238,14 +244,15 @@ class MainWindow(QMainWindow):
         # ツールバー
         self.act_edit_mode = QAction("編集モード", self)
         self.act_edit_mode.setCheckable(True)
-        self.act_edit_mode.setToolTip("ON にしたときだけポイント設定を編集できます")
+        self.act_edit_mode.setToolTip("ON にしたときだけポイント設定とスクリプトを編集できます")
         self.act_edit_mode.toggled.connect(self._on_edit_mode_toggled)
         self.act_save = QAction("保存", self)
         self.act_save.setShortcut(QKeySequence.StandardKey.Save)
-        self.act_save.setToolTip("未保存の変更をプレビューしてから DB へ反映します (Ctrl+S)")
+        self.act_save.setToolTip("未保存の変更をプレビューしてから DB へ反映します (Ctrl+S)。"
+                                 "スクリプトは保存前に文法チェックを行います")
         self.act_save.triggered.connect(lambda: self.save())
         self.act_undo = QAction("元に戻す", self)
-        self.act_undo.setToolTip("未保存の変更をすべて破棄します")
+        self.act_undo.setToolTip("未保存の変更をすべて破棄し、DB から読み込んだ内容に戻します")
         self.act_undo.triggered.connect(self._undo_all)
 
     def _build_menu(self) -> None:
@@ -343,6 +350,7 @@ class MainWindow(QMainWindow):
         self.script_tab.open_window_requested.connect(self._open_script_window)
         self.script_tab.compare_requested.connect(self._open_similar_compare)
         self.script_tab.sidebar_toggled.connect(self._on_script_sidebar_toggled)
+        self.script_tab.dirty_changed.connect(lambda *_: self._on_changes_count(0))
         self._set_visible_tabs([TAB_OVERVIEW])
         self.overview.set_items("Apriso MI設定ツール", [("状態", "データが読み込まれていません。")])
 
@@ -439,7 +447,7 @@ class MainWindow(QMainWindow):
     def reload(self, confirm: bool = True) -> None:
         if self._loading:
             return
-        if confirm and self.session.has_changes():
+        if confirm and self._has_unsaved():
             if not self._confirm_discard("再読込すると、未保存の変更は破棄されます。"):
                 return
         if not self.config_manager.is_connection_configured():
@@ -472,7 +480,8 @@ class MainWindow(QMainWindow):
         self.snapshot = snapshot
         # スナップショットを読んだ接続先を記録する（保存時に接続先が変わっていないか確認する）
         self._snapshot_conn = self._loading_conn
-        self._snapshot_stale = False
+        self._points_stale = False
+        self._script_stale = False
         self.session.reset(snapshot)
         self._apply_edit_state()
         self.script_tab.set_snapshot(snapshot)
@@ -656,15 +665,61 @@ class MainWindow(QMainWindow):
         node = self._node_of(current)
         new_group = self._group_of_node(node)
         old_group = self._point_group_id
+        prev = QPersistentModelIndex(previous)
         # 保存直後の再読込中は、読み込み完了時に変更が破棄されるため確認しない
+        if not self._loading and self.script_tab.is_dirty():
+            switching, _new_action = self._script_switch_of_node(node)
+            if switching and not self._resolve_unsaved_script():
+                # キャンセル: 元の選択に戻す
+                QTimer.singleShot(0, lambda: self._restore_selection(prev))
+                return
         if (old_group is not None and new_group != old_group and not self._loading
                 and self.session.group_has_changes(old_group)):
             if not self._resolve_unsaved_group(old_group):
                 # キャンセル: 元の選択に戻す
-                prev = QPersistentModelIndex(previous)
                 QTimer.singleShot(0, lambda: self._restore_selection(prev))
                 return
         self._show_node(node)
+
+    def _script_switch_of_node(self, node: tuple[str, int] | None) -> tuple[bool, int | None]:
+        """そのノードを選ぶとスクリプトタブの表示が別のアクションに替わるか。
+
+        グループ・アクション以外（データソース等）ではスクリプトタブの内容は替わらない。
+        戻り値: (替わるか, 新しいアクション ID)
+        """
+        if node is None or self.snapshot is None:
+            return False, None
+        kind, node_id = node
+        if kind == KIND_ACTION:
+            new_action = node_id
+        elif kind == KIND_GROUP:
+            first = self.snapshot.first_script_action(node_id)
+            new_action = first.id if first is not None else None
+        else:
+            return False, None
+        return new_action != self.script_tab.current_action_id(), new_action
+
+    def _resolve_unsaved_script(self) -> bool:
+        """スクリプトの表示を替える前に、未保存の変更を確認する。続行してよければ True。"""
+        action, group, _script = self.script_tab.edit_target()
+        name = f"{group.name if group else '?'} / {action.name if action else '?'}"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("未保存の変更")
+        box.setText(f"スクリプト「{name}」に未保存の変更があります。")
+        box.setInformativeText("保存しますか？　「破棄」を選ぶと、スクリプトの変更を取り消して切り替えます。")
+        save_btn = box.addButton("保存", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = box.addButton("破棄", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is discard_btn:
+            self.script_tab.revert_edits()
+            return True
+        if clicked is save_btn:
+            return self._save_script()
+        return False
 
     def _restore_selection(self, prev: QPersistentModelIndex) -> None:
         if not prev.isValid():
@@ -693,7 +748,7 @@ class MainWindow(QMainWindow):
             self.session.revert_group(group_id)
             return True
         if clicked is save_btn:
-            return self.save()
+            return self._save_points()
         return False
 
     # ==================================================================
@@ -838,7 +893,8 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.warning(
                 self, "編集モード",
                 "編集モードにします。\n保存すると、接続先 "
-                f"{self.config.connection.display_name()} の MI_ACTION_GROUP_POINT に書き込みます。\n"
+                f"{self.config.connection.display_name()} の MI_ACTION_GROUP_POINT（ポイント設定）"
+                "または SCRIPT（スクリプト）に書き込みます。\n"
                 "よろしいですか？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -847,57 +903,215 @@ class MainWindow(QMainWindow):
                 self._set_edit_action_checked(False)
                 return
         else:
-            if self.session.has_changes():
+            if self._has_unsaved():
                 if not self._confirm_discard("閲覧モードに戻ると、未保存の変更は破棄されます。"):
                     self._set_edit_action_checked(True)
                     return
-                self.session.revert_all()
+                self._revert_all_unsaved()
         self.edit_mode = checked
         self._apply_edit_state()
         self._update_actions()
         self._update_status_bar()
 
     def _can_edit(self) -> bool:
-        """表で編集できるか（編集モード ON、かつ読み込み中・保存後の再読込待ちでない）。"""
-        return self.edit_mode and not self._loading and not self._snapshot_stale
+        """ポイント設定を表で編集できるか（編集モード ON、かつ読み込み中・保存後の再読込待ちでない）。"""
+        return self.edit_mode and not self._loading and not self._points_stale
+
+    def _can_edit_script(self) -> bool:
+        """スクリプトを編集できるか（編集モード ON、かつ読み込み中・保存後の再読込待ちでない）。"""
+        return self.edit_mode and not self._loading and not self._script_stale
 
     def _apply_edit_state(self) -> None:
         enabled = self._can_edit()
         self.point_tab.set_edit_mode(enabled)
         if self._all_points_view is not None:
             self._all_points_view.set_edit_mode(enabled)
+        self.script_tab.set_edit_enabled(self._can_edit_script())
+
+    # --- 未保存の変更（ポイント設定 + スクリプト） ------------------------------
+    def _has_unsaved(self) -> bool:
+        return self.session.has_changes() or self.script_tab.is_dirty()
+
+    def _unsaved_description(self) -> str:
+        parts = []
+        n = self.session.change_count()
+        if n:
+            parts.append(f"ポイント設定の変更 {n} 件")
+        if self.script_tab.is_dirty():
+            action, group, _script = self.script_tab.edit_target()
+            name = f"{group.name if group else '?'} / {action.name if action else '?'}"
+            parts.append(f"スクリプト（{name}）の変更")
+        return "、".join(parts) or "なし"
+
+    def _revert_all_unsaved(self) -> None:
+        self.session.revert_all()
+        self.script_tab.revert_edits()
 
     def _set_edit_action_checked(self, checked: bool) -> None:
         self.act_edit_mode.blockSignals(True)
         self.act_edit_mode.setChecked(checked)
         self.act_edit_mode.blockSignals(False)
 
-    def _confirm_discard(self, message: str) -> bool:
-        n = self.session.change_count()
+    def _confirm_discard(self, message: str, points_only: bool = False) -> bool:
+        if points_only:
+            desc = f"ポイント設定の変更 {self.session.change_count()} 件"
+        else:
+            desc = self._unsaved_description()
         answer = QMessageBox.question(
             self, "未保存の変更",
-            f"未保存の変更が {n} 件あります。\n{message}\n破棄してよろしいですか？",
+            f"未保存の変更があります（{desc}）。\n{message}\n破棄してよろしいですか？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         return answer == QMessageBox.StandardButton.Yes
 
     def _undo_all(self) -> None:
-        if not self.session.has_changes():
+        if not self._has_unsaved():
             return
-        if self._confirm_discard("「元に戻す」で、すべての未保存の変更を取り消します。"):
-            self.session.revert_all()
+        if self._confirm_discard("「元に戻す」で、すべての未保存の変更を取り消し、"
+                                 "DB から読み込んだ内容に戻します。"):
+            self._revert_all_unsaved()
 
     def save(self, reload_after: bool = True) -> bool:
-        """未保存の変更をプレビューし、実行する。保存に成功したら True。"""
+        """未保存の変更（ポイント設定、スクリプト）をプレビューし、実行する。
+
+        両方に未保存の変更がある場合は、ポイント設定 → スクリプトの順に保存する。
+        すべて保存できたら True。
+        """
+        if not self.edit_mode or self.snapshot is None:
+            return False
+        has_points = self.session.has_changes()
+        has_script = self.script_tab.is_dirty()
+        if not has_points and not has_script:
+            QMessageBox.information(self, "保存", "未保存の変更はありません。")
+            return False
+        ok = True
+        if has_points:
+            ok = self._save_points(reload_after=reload_after)
+        if ok and has_script:
+            ok = self._save_script(reload_after=reload_after)
+        return ok
+
+    def _save_points(self, reload_after: bool = True) -> bool:
+        """ポイント設定の未保存の変更をプレビューし、実行する。保存に成功したら True。"""
         if not self.edit_mode or self.snapshot is None:
             return False
         rows = self.session.pending_rows()
         if not rows:
-            QMessageBox.information(self, "保存", "未保存の変更はありません。")
             return False
         cs = build_change_set(self.snapshot, rows, "PointEdit")
         return self._run_preview(cs, reload_after=reload_after)
+
+    def _save_script(self, reload_after: bool = True) -> bool:
+        """スクリプトタブの未保存の変更を、文法チェック → プレビュー → 実行の順に保存する。"""
+        tab = self.script_tab
+        if not self.edit_mode or self.snapshot is None or not tab.is_dirty():
+            return False
+        if not self._check_can_write(script=True):
+            return False
+        if not self._ensure_updated_by():
+            return False
+        # 更新者名の設定で接続設定ダイアログを開いた場合に備えて、もう一度確認する
+        if not self._check_can_write(script=True):
+            return False
+        action, group, script = tab.edit_target()
+        if action is None or script is None:
+            return False
+
+        # 1. 文法チェック（ワーカースレッドで実行し、終わるまで待つ）
+        source = tab.current_source()
+        check = tab.run_check_blocking()
+        # チェックを待つ間に状態が変わっていないこと（編集・切り替え・再読込・編集モード OFF）
+        if (not self.edit_mode or self._loading or self.snapshot is None
+                or tab.edit_target()[2] is not script or tab.current_source() != source):
+            QMessageBox.warning(self, "保存", "文法チェックの間に表示や内容が変わったため、保存を中止しました。"
+                                "もう一度保存してください。")
+            return False
+        if check is None:
+            QMessageBox.warning(self, "保存", "このスクリプトは文法チェックできないため、保存できません。")
+            return False
+        if check.status == STATUS_ERROR:
+            tab.show_errors()
+            if self.tabs.isTabVisible(TAB_SCRIPT):
+                self.tabs.setCurrentIndex(TAB_SCRIPT)
+            QMessageBox.warning(
+                self, "保存",
+                f"文法チェックでエラーが {len(check.errors)} 件見つかったため、保存を中止しました。\n"
+                "エラー一覧を確認して修正してください。",
+            )
+            return False
+        if check.status == STATUS_UNAVAILABLE:
+            tab.show_errors()
+            answer = QMessageBox.warning(
+                self, "文法チェック",
+                f"文法チェックを実行できませんでした。\n{check.reason}\n\nチェックなしで保存しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+
+        # 2. <Source> だけを置き換えた XML を組み立てる（読み直して確認する）
+        try:
+            new_xml = build_script_xml(script.script_xml, source)
+        except ScriptRewriteError as e:
+            show_error(self, "保存", f"スクリプト定義を組み立てられないため、保存を中止しました。\n{e}")
+            return False
+        change = ScriptChange(
+            script_id=script.id,
+            action_id=action.id,
+            action_name=action.name,
+            group_name=group.name if group else "?",
+            original_xml=script.script_xml or "",
+            new_xml=new_xml,
+            original_source=script.parsed().source,
+            new_source=source,
+            newline=detect_source_newline(script.script_xml),
+            loaded_last_update_on=script.last_update_on,
+            loaded_last_updated_by=script.last_updated_by,
+            check_summary=check.summary() if check.checked else "未実施（承認済み）",
+        )
+        if change.is_empty:
+            QMessageBox.information(self, "保存", "DB の内容との差分はありません。")
+            return False
+
+        # 同じ SCRIPT を複数のアクションが参照している場合は、すべてに影響することを示す
+        warnings: list[str] = []
+        users = [a for a in self.snapshot.actions.values() if a.script_id == script.id]
+        if len(users) > 1:
+            names = []
+            for a in users:
+                g = self.snapshot.action_groups.get(a.action_group_id)
+                names.append(f"{g.name if g else '?'} / {a.name}")
+            warnings.append(f"この SCRIPT（ID={script.id}）は {len(users)} 件のアクションから参照されています。"
+                            "保存するとすべてに反映されます: " + "、".join(names))
+
+        # 3. プレビュー → 実行
+        dlg = ScriptPreviewDialog(change, check, self._make_database(), self.config_manager, self,
+                                  warnings=warnings)
+        dlg.exec()
+        result = dlg.execution_result
+        if result is not None and result.success:
+            # 保存済みの変更は未保存として残さない。再読込が終わるまでスクリプトを編集・保存させない
+            self._script_stale = True
+            tab.accept_saved(change.new_source)
+            self._apply_edit_state()
+            self._update_actions()
+            self._update_status_bar()
+            self._after_saved(reload_after)
+            return True
+        return False
+
+    def _after_saved(self, reload_after: bool) -> None:
+        """保存の後の再読込。別の種類の未保存の変更が残っている場合は、それを破棄しないよう再読込しない。"""
+        if not reload_after:
+            return
+        if self._has_unsaved():
+            self._set_message("保存しました。ほかに未保存の変更が残っているため、まだ再読込していません。"
+                              "残りの変更を保存するか、再読込（F5）してください。")
+            return
+        # DB を再読込して表示を更新する（未保存の変更は保存済みのため破棄してよい）
+        self.reload(confirm=False)
 
     def _ensure_updated_by(self) -> bool:
         err = validate_updated_by(self.config.updated_by)
@@ -912,12 +1126,15 @@ class MainWindow(QMainWindow):
             self._open_connection_dialog(reload_after=False)
         return not validate_updated_by(self.config.updated_by)
 
-    def _check_can_write(self) -> bool:
-        """書き込み前の確認（接続先が読み込み時と同じか、保存後の再読込が済んでいるか）。"""
+    def _check_can_write(self, script: bool = False) -> bool:
+        """書き込み前の確認（接続先が読み込み時と同じか、保存後の再読込が済んでいるか）。
+
+        script=True: スクリプトの保存（SCRIPT）、False: ポイント設定の保存（MI_ACTION_GROUP_POINT）。
+        """
         if self._loading:
             QMessageBox.information(self, "保存", "DB から読み込み中です。完了してから保存してください。")
             return False
-        if self._snapshot_stale:
+        if self._script_stale if script else self._points_stale:
             QMessageBox.warning(
                 self, "保存",
                 "前回の保存後に再読込できていないため、表示が DB の内容と一致していません。\n"
@@ -948,13 +1165,11 @@ class MainWindow(QMainWindow):
         result = dlg.execution_result
         if result is not None and result.success:
             # 保存済みの変更は未保存として残さない。再読込が終わるまで編集・保存させない
-            self._snapshot_stale = True
+            self._points_stale = True
             self.session.revert_all()
             self._apply_edit_state()
             self._update_actions()
-            if reload_after:
-                # DB を再読込して表示を更新する（未保存の変更は保存済みのため破棄してよい）
-                self.reload(confirm=False)
+            self._after_saved(reload_after)
             return True
         return False
 
@@ -1026,7 +1241,9 @@ class MainWindow(QMainWindow):
                                     "インポートは編集モードで行います。ツールバーの「編集モード」を ON にしてください。")
             return
         if self.session.has_changes():
-            if not self._confirm_discard("インポートは DB の内容と突き合わせるため、未保存の変更は破棄されます。"):
+            if not self._confirm_discard("インポートは DB の内容と突き合わせるため、"
+                                         "ポイント設定の未保存の変更は破棄されます。",
+                                         points_only=True):
                 return
             self.session.revert_all()
         paths = self.config.paths
@@ -1220,11 +1437,18 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _show_about(self) -> None:
+        try:
+            compilers = describe_compilers(self.config.compiler.csc_path)
+        except Exception as e:  # 検出に失敗してもバージョン情報は表示する
+            logger.exception("C# コンパイラの検出に失敗しました")
+            compilers = f"使用する C# コンパイラ: 検出に失敗しました（{e}）"
         QMessageBox.about(
             self, "バージョン情報",
             f"{APP_TITLE} ({APP_NAME})\nバージョン {APP_VERSION}\n\n"
             "DELMIA Apriso の Machine Integrator 設定を閲覧・編集するツールです。\n"
-            "第1版: スクリプトは閲覧のみ、アクショングループのポイント設定は編集可能。",
+            "アクショングループのポイント設定と、スクリプトのソースを編集できます"
+            "（スクリプトは保存前に文法チェックを行います）。\n\n"
+            f"{compilers}",
         )
 
     # ==================================================================
@@ -1241,11 +1465,14 @@ class MainWindow(QMainWindow):
         loaded = self.snapshot is not None
         busy = self._loading
         has_changes = self.session.has_changes()
+        script_dirty = self.script_tab.is_dirty()
         self.act_reload.setEnabled(not busy)
         self.act_connection.setEnabled(not busy)
         self.act_edit_mode.setEnabled(loaded and not busy)
-        self.act_save.setEnabled(self._can_edit() and loaded and has_changes)
-        self.act_undo.setEnabled(self._can_edit() and has_changes)
+        self.act_save.setEnabled(loaded and ((self._can_edit() and has_changes)
+                                             or (self._can_edit_script() and script_dirty)))
+        self.act_undo.setEnabled((self._can_edit() and has_changes)
+                                 or (self._can_edit_script() and script_dirty))
         for act in (self.act_export_scripts, self.act_export_points, self.act_all_points,
                     self.act_script_compare, *self.check_actions):
             act.setEnabled(loaded and not busy)
@@ -1265,8 +1492,14 @@ class MainWindow(QMainWindow):
         else:
             self.counts_label.setText("")
         n = self.session.change_count()
-        self.unsaved_label.setText(f"未保存の変更 {n} 件" if n else "")
-        self.unsaved_label.setProperty("hasChanges", "true" if n else "false")
+        script_dirty = self.script_tab.is_dirty()
+        parts = []
+        if n:
+            parts.append(f"未保存の変更 {n} 件")
+        if script_dirty:
+            parts.append("スクリプト未保存")
+        self.unsaved_label.setText(" / ".join(parts))
+        self.unsaved_label.setProperty("hasChanges", "true" if parts else "false")
         refresh_style(self.unsaved_label)
 
     # ==================================================================
@@ -1277,11 +1510,15 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "終了", "DB から読み込み中です。完了してから終了してください。")
             event.ignore()
             return
-        if self.session.has_changes():
+        if self.script_tab.is_check_running():
+            QMessageBox.information(self, "終了", "文法チェックの実行中です。完了してから終了してください。")
+            event.ignore()
+            return
+        if self._has_unsaved():
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Warning)
             box.setWindowTitle("未保存の変更")
-            box.setText(f"未保存の変更が {self.session.change_count()} 件あります。")
+            box.setText(f"未保存の変更があります（{self._unsaved_description()}）。")
             box.setInformativeText("終了する前に保存しますか？")
             save_btn = box.addButton("保存", QMessageBox.ButtonRole.AcceptRole)
             discard_btn = box.addButton("破棄して終了", QMessageBox.ButtonRole.DestructiveRole)

@@ -5,8 +5,11 @@
 - MI_POINT.Parameters（外側 XML の <SerializedData> にエスケープされた内側 XML が
   入る二重構造）から OPC UA のポイント属性を取り出す。
 
+- SCRIPT.Script の <Source> の中身だけを差し替えた XML を組み立てる（build_script_xml。
+  変更指示002。XML パーサで出力し直さず、元の文字列を部分的に置き換える）。
+
 標準ライブラリの xml.etree.ElementTree を使う。解析に失敗しても例外は送出せず、
-空の結果とエラーメッセージ（error 属性）を返す。
+空の結果とエラーメッセージ（error 属性）を返す（build_script_xml は例外を送出する）。
 """
 
 from __future__ import annotations
@@ -146,7 +149,108 @@ def parse_script(xml_text: str | None) -> ParsedScript:
     result.usings = _text(_child(root, "ScriptUsings")).strip()
     result.language = _text(_child(root, "ScriptLanguage")).strip()
     # <ScriptId> は用途未確認（内容のハッシュである可能性）。第1版では読まない（未確認6）。
+    # 変更指示002: <ScriptId> はソースと入力変数から決まる値（計算式は不明）。アプリは変更しない。
     return result
+
+
+# ----------------------------------------------------------------------
+# SCRIPT.Script の <Source> の書き換え（変更指示002）
+# ----------------------------------------------------------------------
+# XML パーサで読み込んで出力し直す方法は使わない（属性の順序、名前空間宣言、改行、
+# <ScriptId> などが変わるおそれがあるため）。元の文字列のうち、最初の <Source> と
+# 最初の </Source> に挟まれた部分だけを置き換え、それ以外は 1 文字も変えない。
+SOURCE_OPEN_TAG = "<Source>"
+SOURCE_CLOSE_TAG = "</Source>"
+_EMPTY_SOURCE_RE = re.compile(r"<Source\s*/>")
+
+NEWLINE_CRLF = "CRLF"
+NEWLINE_LF = "LF"
+
+
+class ScriptRewriteError(ValueError):
+    """<Source> を書き換えられない（書き戻しを行わない）。"""
+
+
+def find_source_span(xml_text: str | None) -> tuple[int, int]:
+    """最初の <Source> と最初の </Source> に挟まれた部分の (開始位置, 終了位置)。
+
+    見つからない場合や <Source /> の形の場合は ScriptRewriteError を送出する。
+    """
+    text = xml_text or ""
+    open_pos = text.find(SOURCE_OPEN_TAG)
+    empty = _EMPTY_SOURCE_RE.search(text)
+    if empty is not None and (open_pos < 0 or empty.start() < open_pos):
+        raise ScriptRewriteError("スクリプト定義の <Source> が空要素（<Source />）のため、書き戻せません。")
+    if open_pos < 0:
+        raise ScriptRewriteError("スクリプト定義に <Source>…</Source> が見つからないため、書き戻せません。")
+    start = open_pos + len(SOURCE_OPEN_TAG)
+    end = text.find(SOURCE_CLOSE_TAG, start)
+    if end < 0:
+        raise ScriptRewriteError("スクリプト定義に </Source> が見つからないため、書き戻せません。")
+    return start, end
+
+
+def detect_source_newline(xml_text: str | None) -> str:
+    """元の <Source> の改行方式。\\r\\n が含まれていれば CRLF、なければ LF。
+
+    XML パーサは改行を LF に正規化するため、解析前の文字列で判定する。
+    """
+    try:
+        start, end = find_source_span(xml_text)
+    except ScriptRewriteError:
+        return NEWLINE_LF
+    return NEWLINE_CRLF if "\r\n" in (xml_text or "")[start:end] else NEWLINE_LF
+
+
+def escape_source_text(text: str) -> str:
+    """<Source> に入れる文字列のエスケープ。& → &amp;、< → &lt;、> → &gt; の 3 つだけをこの順で行う。"""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _signature(ps: ParsedScript) -> tuple:
+    """書き換えで変わってはいけない部分（入力変数・呼び出しオペレーション・using・言語）。"""
+    return (
+        tuple((v.name, v.type) for v in ps.inputs),
+        tuple(ps.operations),
+        ps.usings,
+        ps.language,
+    )
+
+
+def build_script_xml(original_xml: str | None, new_source: str) -> str:
+    """元の SCRIPT.Script の <Source> の中身だけを new_source に置き換えた XML を返す。
+
+    - new_source の改行は \\n に統一してから、元の改行方式（CRLF / LF）へ戻す。
+    - 組み立てた XML を parse_script() で読み直し、ソースが new_source と一致すること、
+      入力変数・呼び出しオペレーション等が元と変わっていないことを確認する。
+    確認できない場合は ScriptRewriteError を送出する（保存を中止する）。
+    """
+    original = original_xml or ""
+    before = parse_script(original)
+    if before.error:
+        raise ScriptRewriteError(f"元のスクリプト定義を解析できないため、書き戻せません。\n{before.error}")
+
+    start, end = find_source_span(original)
+    normalized = normalize_newlines(new_source or "")
+    body = normalized
+    if detect_source_newline(original) == NEWLINE_CRLF:
+        body = body.replace("\n", "\r\n")
+    new_xml = original[:start] + escape_source_text(body) + original[end:]
+
+    # 置き換えた部分以外が 1 文字も変わっていないこと
+    if new_xml[:start] != original[:start] or new_xml[len(new_xml) - (len(original) - end):] != original[end:]:
+        raise ScriptRewriteError("書き換え範囲の外側が変わってしまうため、保存を中止しました。")
+
+    after = parse_script(new_xml)
+    if after.error:
+        raise ScriptRewriteError(f"書き換えた XML を解析できないため、保存を中止しました。\n{after.error}")
+    if after.source != normalized:
+        raise ScriptRewriteError("書き換えた XML から取り出したソースが編集後のソースと一致しないため、"
+                                 "保存を中止しました。")
+    if _signature(after) != _signature(before):
+        raise ScriptRewriteError("書き換えた XML の入力変数・呼び出しオペレーションが元と一致しないため、"
+                                 "保存を中止しました。")
+    return new_xml
 
 
 # ----------------------------------------------------------------------

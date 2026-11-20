@@ -102,6 +102,16 @@ class PathsConfig:
 
 
 @dataclass
+class CompilerConfig:
+    """文法チェックに使う C# コンパイラの設定（設定画面はなく、config.json を直接編集する）。"""
+
+    # 使用する csc.exe のパス。空なら自動検出（Visual Studio 付属の Roslyn を優先）
+    csc_path: str = ""
+    # コンパイルのタイムアウト（秒）
+    timeout_seconds: int = 60
+
+
+@dataclass
 class AppConfig:
     """アプリ全体の設定。"""
 
@@ -110,6 +120,7 @@ class AppConfig:
     viewer: ViewerConfig = field(default_factory=ViewerConfig)
     window: WindowConfig = field(default_factory=WindowConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
+    compiler: CompilerConfig = field(default_factory=CompilerConfig)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -125,6 +136,7 @@ class AppConfig:
         cfg.viewer = _load_section(ViewerConfig, data.get("viewer"))
         cfg.window = _load_section(WindowConfig, data.get("window"))
         cfg.paths = _load_section(PathsConfig, data.get("paths"))
+        cfg.compiler = _load_section(CompilerConfig, data.get("compiler"))
 
         # 値の正規化
         if cfg.connection.auth not in (AUTH_WINDOWS, AUTH_SQL):
@@ -135,6 +147,9 @@ class AppConfig:
             cfg.viewer.font_size = 10
         if cfg.window.script_sidebar_width <= 0:
             cfg.window.script_sidebar_width = 320
+        cfg.compiler.csc_path = cfg.compiler.csc_path.strip()
+        if cfg.compiler.timeout_seconds <= 0:
+            cfg.compiler.timeout_seconds = 60
         cfg.window.table_headers = {
             str(k): v for k, v in cfg.window.table_headers.items() if isinstance(v, str)
         }

@@ -1,6 +1,10 @@
 """ChangeSet の退避・実行・ログ
 
-DB への書き込みはすべて本モジュールを通す（書き込み対象は MI_ACTION_GROUP_POINT のみ）。
+DB への書き込みはすべて本モジュールを通す。書き込み対象は次の 2 テーブルのみ。
+  - MI_ACTION_GROUP_POINT（ポイント設定。ChangeSet / execute_change_set）
+  - SCRIPT（スクリプト。変更指示002。ScriptChange / execute_script_change）
+    更新する列は Script、LastUpdateOn、LastUpdatedBy、RowVersionStamp のみ。
+    MI_ACTION の ValidationResult / ValidatedOn / ValidatedBy など、ほかのテーブルは更新しない。
 
 手順（指示書 5.10）:
   1. 実行直前に、更新・削除対象の行（全列）を backup\\YYYYMMDD_HHMMSS_<操作名>.json に
@@ -26,14 +30,17 @@ import os
 import re
 import threading
 import traceback
+import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, time
+from decimal import Decimal
 from typing import TYPE_CHECKING, Callable
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from core import APP_NAME, APP_VERSION
 from core.config_manager import UPDATED_BY_MAX_LENGTH
+from core.script_parser import parse_script
 
 if TYPE_CHECKING:
     from core.db import Database
@@ -542,6 +549,334 @@ class ChangeSetExecutor(QObject):
             )
         except Exception as e:  # 想定外の例外も必ず結果として返す
             logger.exception("ChangeSet の実行中に予期しないエラーが発生しました")
+            result = ExecutionResult(False, f"予期しないエラーが発生しました: {e}",
+                                     detail=traceback.format_exc())
+        self.finished.emit(result)
+
+
+# ======================================================================
+# スクリプト（SCRIPT テーブル）の書き戻し（変更指示002）
+# ======================================================================
+# 更新する列は Script、LastUpdateOn、LastUpdatedBy、RowVersionStamp のみ（パラメータ化）
+SQL_UPDATE_SCRIPT = (
+    "UPDATE SCRIPT\n"
+    "SET Script          = ?,\n"
+    "    LastUpdateOn    = GETUTCDATE(),\n"
+    "    LastUpdatedBy   = ?,\n"
+    "    RowVersionStamp = ISNULL(RowVersionStamp, 0) + 1\n"
+    "WHERE ID = ? AND RowVersionStamp = ?;"
+)
+
+# 更新前の行（全列）の読み取り。退避と同時更新の確認に使う（データは変更しない）。
+# トランザクション内で更新ロックを取り、読み取りから UPDATE までの間に他で更新されないようにする。
+SQL_SELECT_SCRIPT_FOR_UPDATE = "SELECT * FROM SCRIPT WITH (UPDLOCK, ROWLOCK) WHERE ID = ?;"
+
+# 更新後の確認用（同じトランザクション内で読み直す）
+SQL_SELECT_SCRIPT_AFTER = "SELECT Script FROM SCRIPT WHERE ID = ?;"
+
+SCRIPT_REFRESH_NOTICE = ("保存しました。MI へ反映するには、Apriso のマシーンインテグレータ設定で"
+                         "『マシーンの更新』を実行してください。")
+
+SCRIPT_OPERATION = "ScriptEdit"
+
+
+@dataclass
+class ScriptChange:
+    """スクリプト 1 件の書き戻し内容。"""
+
+    script_id: int
+    action_id: int
+    action_name: str
+    group_name: str
+    original_xml: str            # DB から読み込んだ SCRIPT.Script（同時更新の確認に使う）
+    new_xml: str                 # <Source> の中身だけを置き換えた XML
+    original_source: str         # 改行 \n
+    new_source: str              # 改行 \n
+    newline: str                 # 書き戻す改行方式（"CRLF" / "LF"）
+    loaded_last_update_on: datetime | None = None
+    loaded_last_updated_by: str | None = None
+    check_summary: str = ""      # 文法チェックの結果（ログ用）
+    operation: str = SCRIPT_OPERATION
+
+    @property
+    def label(self) -> str:
+        return f"{self.group_name} / {self.action_name}（SCRIPT.ID={self.script_id}）"
+
+    @property
+    def is_empty(self) -> bool:
+        return self.new_xml == self.original_xml
+
+
+def preview_script_sql(change: ScriptChange, updated_by: str = "") -> str:
+    """表示用の SQL（実行には使わない）。XML は長いため文字数だけを示す。"""
+    user = (updated_by or "").strip() or "<更新者名>"
+    return (
+        "-- 表示用の SQL です。実行時はパラメータ化クエリを使用します。\n"
+        "-- 実行直前に同じトランザクション内で対象行を読み直し（更新ロック）、\n"
+        "-- 読み込み時から Script・LastUpdateOn が変わっていないことを確認してから更新します。\n"
+        "-- RowVersionStamp には、そのとき読み直した値を使います。\n\n"
+        f"-- [更新] {change.label}\n"
+        "UPDATE SCRIPT\n"
+        f"SET Script          = N'…変更後のスクリプト定義（{len(change.new_xml)} 文字）…',\n"
+        "    LastUpdateOn    = GETUTCDATE(),\n"
+        f"    LastUpdatedBy   = {sql_literal(user)},\n"
+        "    RowVersionStamp = ISNULL(RowVersionStamp, 0) + 1\n"
+        f"WHERE ID = {sql_literal(change.script_id)} AND RowVersionStamp = <実行時に読み直した値>;"
+    )
+
+
+def _json_value(value):
+    """退避 JSON 用に DB の値を変換する。"""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "0x" + bytes(value).hex().upper()
+    if isinstance(value, (Decimal, uuid.UUID)):
+        return str(value)
+    return str(value)
+
+
+def build_script_backup_payload(change: ScriptChange, row: dict, now: datetime) -> dict:
+    """退避 JSON の内容（更新前の行の全列）。"""
+    return {
+        "app": f"{APP_NAME} {APP_VERSION}",
+        "created_at_local": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "operation": change.operation,
+        "table": "SCRIPT",
+        "note": "日時の列は DB の値（UTC）。before は更新直前に読み直した行の全列。",
+        "target": {
+            "group_name": change.group_name,
+            "action_name": change.action_name,
+            "action_id": change.action_id,
+            "script_id": change.script_id,
+            "newline": change.newline,
+        },
+        "before": {k: _json_value(v) for k, v in row.items()},
+        "after": {"Script": change.new_xml},
+    }
+
+
+def build_script_restore_sql(change: ScriptChange, row: dict, now: datetime) -> str:
+    """Script を元の文字列に戻す UPDATE 文（手動実行用。アプリからは実行しない）。
+
+    改行は CRLF。文字列リテラル N'…' 内はスクリプトの元の文字列をそのまま埋め込む（' は ''）。
+    """
+    lines = [
+        f"-- {APP_NAME} 復元用 SQL",
+        f"-- 作成日時: {now:%Y-%m-%d %H:%M:%S}",
+        f"-- 操作: {change.operation}",
+        f"-- 対象: {change.label}",
+        f"-- 更新前の LastUpdateOn = {sql_literal(_row_get(row, 'LastUpdateOn'))}, "
+        f"LastUpdatedBy = {sql_literal(_row_get(row, 'LastUpdatedBy'))}, "
+        f"RowVersionStamp = {sql_literal(_row_get(row, 'RowVersionStamp'))}",
+        "-- 注意: 本ファイルはアプリからは実行されません。内容を確認したうえで手動で実行してください。",
+        "-- 実行後、Apriso のマシーンインテグレータ設定で『マシーンの更新』を実行してください。",
+        "",
+        "SET XACT_ABORT ON;",
+        "BEGIN TRANSACTION;",
+        "",
+        f"UPDATE SCRIPT SET Script = {sql_literal(change.original_xml)} "
+        f"WHERE ID = {sql_literal(change.script_id)};",
+        "",
+        "COMMIT TRANSACTION;",
+        "",
+    ]
+    return "\r\n".join(lines)
+
+
+def write_script_backup(change: ScriptChange, row: dict, backup_dir: str,
+                        now: datetime | None = None) -> tuple[str, str]:
+    """退避ファイル（.json と .sql）を書き出し、そのパスを返す。失敗時は例外を送出する。"""
+    now = now or datetime.now()
+    os.makedirs(backup_dir, exist_ok=True)
+    base = _unique_base(
+        backup_dir, f"{now:%Y%m%d_%H%M%S}_{_safe_filename(change.operation)}_{change.script_id}"
+    )
+    json_path = os.path.join(backup_dir, base + ".json")
+    sql_path = os.path.join(backup_dir, base + ".sql")
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(build_script_backup_payload(change, row, now), f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+
+    # 文字列リテラル内の改行（LF / CRLF）を変えないよう、書き出し時の改行変換はしない（newline=""）。
+    # SSMS で文字化けしないよう BOM 付き UTF-8。
+    with open(sql_path, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(build_script_restore_sql(change, row, now))
+        f.flush()
+        os.fsync(f.fileno())
+
+    # 書き出した内容を読み戻して確認する（JSON として読めること）
+    with open(json_path, "r", encoding="utf-8") as f:
+        json.load(f)
+    return json_path, sql_path
+
+
+def _fetch_row_dict(cur) -> dict | None:
+    row = cur.fetchone()
+    if row is None:
+        return None
+    names = [d[0] for d in cur.description]
+    return dict(zip(names, row))
+
+
+def _row_get(row: dict, name: str, default=None):
+    """列名の大文字小文字を区別せずに値を取り出す。"""
+    for k, v in row.items():
+        if k.lower() == name.lower():
+            return v
+    return default
+
+
+def _row_has(row: dict, name: str) -> bool:
+    return any(k.lower() == name.lower() for k in row)
+
+
+class _BackupError(Exception):
+    """退避ファイルの書き出しに失敗した（DB は変更していない）。"""
+
+    def __init__(self, original: Exception):
+        super().__init__(str(original))
+        self.original = original
+
+
+def execute_script_change(change: ScriptChange, database: "Database", updated_by: str,
+                          backup_dir: str, log_dir: str) -> ExecutionResult:
+    """スクリプト 1 件を書き戻す。ワーカースレッドから呼ぶこと。
+
+    1 トランザクションで次を行い、どこかで失敗したらロールバックする。
+      1. 対象行を更新ロック付きで読み直す（全列）。読み込み時から Script・LastUpdateOn が
+         変わっていれば「他で更新された」として中止する。
+      2. 退避（更新前の行の全列を .json、Script を元に戻す UPDATE 文を .sql）。失敗したら中止。
+      3. UPDATE（WHERE ID = ? AND RowVersionStamp = ?）。影響行数が 1 でなければ中止。
+      4. 同じトランザクション内で読み直し、ソース・入力変数・オペレーションを確認してからコミット。
+    """
+    user = (updated_by or "").strip()
+    counts = f"スクリプト 1 件（{change.label}）"
+
+    err = validate_updated_by(user)
+    if err:
+        return ExecutionResult(False, err)
+    if change.is_empty:
+        return ExecutionResult(False, "実行する変更がありません。")
+
+    json_path = sql_path = ""
+    conn = None
+    try:
+        conn = database.connect(readonly=False)
+        cur = conn.cursor()
+        # rowcount で影響行数を確認するため、NOCOUNT を明示的に OFF にする（データは変更しない）
+        cur.execute("SET NOCOUNT OFF;")
+
+        # 1. 読み直しと同時更新の確認
+        cur.execute(SQL_SELECT_SCRIPT_FOR_UPDATE, (change.script_id,))
+        row = _fetch_row_dict(cur)
+        if row is None:
+            raise ConcurrencyError(f"SCRIPT の行（ID={change.script_id}）が見つかりません。"
+                                   "読み込み後に削除された可能性があります。")
+        if not (_row_has(row, "Script") and _row_has(row, "RowVersionStamp")):
+            raise RuntimeError("SCRIPT テーブルに Script または RowVersionStamp 列がありません。")
+        if (_row_get(row, "Script") != change.original_xml
+                or _row_get(row, "LastUpdateOn") != change.loaded_last_update_on):
+            raise ConcurrencyError(
+                f"SCRIPT の行（ID={change.script_id}）が、読み込み後に他で更新されています"
+                f"（最終更新者: {_row_get(row, 'LastUpdatedBy') or '-'}）。"
+            )
+        stamp = _row_get(row, "RowVersionStamp")
+        if stamp is None:
+            raise ConcurrencyError(f"SCRIPT の行（ID={change.script_id}）の RowVersionStamp が NULL のため、"
+                                   "同時更新を確認できません。保存は行いません。")
+
+        # 2. 退避（失敗したら実行しない）
+        try:
+            json_path, sql_path = write_script_backup(change, row, backup_dir)
+        except Exception as e:
+            raise _BackupError(e) from e
+
+        # 3. 更新
+        cur.execute(SQL_UPDATE_SCRIPT, (change.new_xml, user, change.script_id, stamp))
+        affected = cur.rowcount
+        if affected != 1:
+            raise ConcurrencyError(
+                f"更新対象の行（SCRIPT.ID={change.script_id}）の影響行数が {affected} でした。"
+                "読み込み後に他で更新された可能性があります。"
+            )
+
+        # 4. 読み直して確認（ソース・入力変数・オペレーション）
+        cur.execute(SQL_SELECT_SCRIPT_AFTER, (change.script_id,))
+        after_row = cur.fetchone()
+        after = parse_script(after_row[0] if after_row else None)
+        expected = parse_script(change.new_xml)
+        if (after.error or after.source != expected.source
+                or [(v.name, v.type) for v in after.inputs] != [(v.name, v.type) for v in expected.inputs]
+                or after.operations != expected.operations):
+            raise RuntimeError("更新後に読み直したスクリプトが、書き込んだ内容と一致しませんでした。")
+        conn.commit()
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                logger.exception("ロールバックに失敗しました")
+        if isinstance(e, _BackupError):
+            logger.exception("退避ファイルの書き出しに失敗しました")
+            write_operation_log(log_dir, user, change.operation, counts, "",
+                                f"中止（退避失敗: {e.original}）")
+            return ExecutionResult(
+                False,
+                "退避ファイルの書き出しに失敗したため、実行を中止しました。DB は変更されていません。",
+                detail=traceback.format_exc(),
+            )
+        is_conflict = isinstance(e, ConcurrencyError)
+        if is_conflict:
+            message = ("他で更新されていたため、保存を取り消しました（ロールバック）。\n"
+                       f"{e}\n再読込してから、もう一度編集してください。")
+        else:
+            message = "DB への書き込みに失敗したため、変更を取り消しました（ロールバック）。"
+        logger.error("スクリプトの書き戻しに失敗しました: %s", e, exc_info=not is_conflict)
+        write_operation_log(log_dir, user, change.operation, counts, json_path,
+                            f"失敗（ロールバック）: {e}")
+        return ExecutionResult(False, message, detail=f"{e}\n\n{traceback.format_exc()}",
+                               backup_json=json_path, backup_sql=sql_path)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    write_operation_log(log_dir, user, change.operation,
+                        f"{counts} 文法チェック={change.check_summary or '-'}", json_path, "成功")
+    return ExecutionResult(True, SCRIPT_REFRESH_NOTICE, backup_json=json_path, backup_sql=sql_path,
+                           updated=1)
+
+
+class ScriptChangeExecutor(QObject):
+    """execute_script_change をワーカースレッドで実行し、結果を Signal で返す。"""
+
+    finished = Signal(object)     # ExecutionResult
+
+    def __init__(self, change: ScriptChange, database: "Database", updated_by: str,
+                 backup_dir: str, log_dir: str):
+        super().__init__()
+        self._change = change
+        self._database = database
+        self._updated_by = updated_by
+        self._backup_dir = backup_dir
+        self._log_dir = log_dir
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = execute_script_change(self._change, self._database, self._updated_by,
+                                           self._backup_dir, self._log_dir)
+        except Exception as e:  # 想定外の例外も必ず結果として返す
+            logger.exception("スクリプトの書き戻し中に予期しないエラーが発生しました")
             result = ExecutionResult(False, f"予期しないエラーが発生しました: {e}",
                                      detail=traceback.format_exc())
         self.finished.emit(result)

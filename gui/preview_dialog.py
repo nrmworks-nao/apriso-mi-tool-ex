@@ -5,6 +5,11 @@ DB への書き込みはすべてこのダイアログを通す。
   - 実行される SQL 文（表示用にパラメータを埋め込んだもの）を確認できる。
   - 対象外の行がある場合は別タブで理由とともに示す。警告（ローカル名の重複）も別タブ。
   - [実行] で、退避 → 1 トランザクションで実行 → ログ をワーカースレッドで行う。
+
+ScriptPreviewDialog（変更指示002）: スクリプト（SCRIPT.Script）の書き戻しの実行確認。
+  - 接続先（サーバー / データベース名）を目立つ位置に表示する。
+  - 対象（グループ名 / アクション名 / SCRIPT.ID）、変更前と変更後のソースの差分
+    （既存の差分表示 DiffView）、文法チェックの結果を表示する。
 """
 
 from __future__ import annotations
@@ -31,14 +36,19 @@ from core.change_executor import (
     MI_REFRESH_NOTICE,
     ChangeSetExecutor,
     ExecutionResult,
+    ScriptChange,
+    ScriptChangeExecutor,
+    preview_script_sql,
     preview_sql,
     validate_updated_by,
 )
+from core.compile_checker import COMPILE_NOTICE, STATUS_OK, STATUS_UNAVAILABLE, CompileResult
 from core.config_manager import ConfigManager
 from core.db import Database
 from core.models import on_off
 from core.point_service import ChangeSet
 from gui import worker
+from gui.diff_dialog import DiffView
 from gui.styles import COLORS
 from gui.table_utils import FilterableTable, ReadOnlyTableModel
 
@@ -253,6 +263,214 @@ class PreviewDialog(QDialog):
                 self, "保存完了",
                 f"{result.message}\n\n退避ファイル: {backup}\n\n{MI_REFRESH_NOTICE}",
             )
+            self.accept()
+            return
+        self.status_label.setText("失敗しました。")
+        msg = result.message
+        if result.backup_json:
+            msg += f"\n\n退避ファイル: {os.path.basename(result.backup_json)}"
+        show_error(self, "保存エラー", msg, result.detail)
+        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.setText("閉じる")
+        self.tabs.setEnabled(True)
+
+    # 実行中は閉じさせない
+    def reject(self) -> None:
+        if self._running:
+            return
+        super().reject()
+
+    def closeEvent(self, event) -> None:
+        if self._running:
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
+def _check_text(check: CompileResult | None) -> tuple[str, str]:
+    """文法チェックの結果の説明と、ラベルの objectName。"""
+    if check is None:
+        return "文法チェック: 未実施", "warningLabel"
+    if check.status == STATUS_OK:
+        return f"文法チェック: {check.summary()}", "successLabel"
+    if check.status == STATUS_UNAVAILABLE:
+        return (f"文法チェック: 未実施（{check.reason}）\n"
+                "チェックなしで保存することが承認されています。"), "warningLabel"
+    return f"文法チェック: {check.summary()}", "errorLabel"
+
+
+class ScriptPreviewDialog(QDialog):
+    """スクリプトの書き戻しのプレビュー（実行確認）。"""
+
+    def __init__(self, change: ScriptChange, check: CompileResult | None, database: Database | None,
+                 config_manager: ConfigManager, parent=None, warnings: list[str] | None = None):
+        super().__init__(parent)
+        self.change = change
+        self.check = check
+        self.database = database
+        self.config_manager = config_manager
+        self.execution_result: ExecutionResult | None = None
+        self._running = False
+        self._handle = None
+        self._executor: ScriptChangeExecutor | None = None
+
+        self.setWindowTitle("変更プレビュー（スクリプト）")
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        self.resize(1300, 820)
+        self.setSizeGripEnabled(True)
+
+        conn = config_manager.config.connection
+        lay = QVBoxLayout(self)
+
+        # 接続先（書き込み先を取り違えないよう目立たせる）
+        banner = QLabel(f"接続先　サーバー: {conn.server or '(未設定)'}　/　データベース: {conn.database}", self)
+        banner.setObjectName("connectionBanner")
+        banner.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(banner)
+
+        target = QLabel(
+            f"対象: グループ {change.group_name}　/　アクション {change.action_name}　/　"
+            f"SCRIPT.ID {change.script_id}",
+            self,
+        )
+        target.setObjectName("headerLabel")
+        target.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(target)
+
+        updated_by = config_manager.config.updated_by
+        self._user_error = validate_updated_by(updated_by)
+        info = QLabel(
+            f"更新者: {updated_by or '(未設定)'}　改行コード: {change.newline}（元のまま）　"
+            "更新する列: Script、LastUpdateOn、LastUpdatedBy、RowVersionStamp（<Source> 以外は変更しません）",
+            self,
+        )
+        info.setObjectName("secondaryLabel")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        check_text, check_kind = _check_text(check)
+        check_label = QLabel(check_text, self)
+        check_label.setObjectName(check_kind)
+        check_label.setWordWrap(True)
+        lay.addWidget(check_label)
+
+        for text in warnings or []:
+            warn = QLabel(text, self)
+            warn.setObjectName("warningLabel")
+            warn.setWordWrap(True)
+            lay.addWidget(warn)
+
+        if self._user_error:
+            err = QLabel(self._user_error, self)
+            err.setObjectName("errorLabel")
+            err.setWordWrap(True)
+            lay.addWidget(err)
+
+        self.tabs = QTabWidget(self)
+        lay.addWidget(self.tabs, 1)
+
+        # 差分（既存の差分表示）
+        self.diff_view = DiffView(config_manager, self)
+        self.diff_view.show_diff("変更前（DB の内容）", change.original_source,
+                                 "変更後（編集した内容）", change.new_source,
+                                 False, "", "")
+        self.tabs.addTab(self.diff_view, "差分")
+
+        # 文法チェックの詳細
+        check_view = QPlainTextEdit(self)
+        check_view.setObjectName("detailText")
+        check_view.setReadOnly(True)
+        check_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        check_view.setPlainText(self._check_detail(check))
+        self.tabs.addTab(check_view, "文法チェック")
+
+        # SQL
+        sql_view = QPlainTextEdit(self)
+        sql_view.setObjectName("sqlViewer")
+        sql_view.setReadOnly(True)
+        sql_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        sql_view.setPlainText(preview_script_sql(change, updated_by))
+        self.tabs.addTab(sql_view, "SQL")
+
+        # 進捗・ボタン
+        bottom = QHBoxLayout()
+        self.progress = QProgressBar(self)
+        self.progress.setVisible(False)
+        bottom.addWidget(self.progress, 1)
+        self.status_label = QLabel("", self)
+        self.status_label.setObjectName("secondaryLabel")
+        bottom.addWidget(self.status_label)
+        bottom.addStretch(1)
+        self.exec_btn = QPushButton("実行", self)
+        self.cancel_btn = QPushButton("キャンセル", self)
+        bottom.addWidget(self.exec_btn)
+        bottom.addWidget(self.cancel_btn)
+        lay.addLayout(bottom)
+
+        self.exec_btn.setEnabled(not change.is_empty and not self._user_error and database is not None)
+        if change.is_empty:
+            self.status_label.setText("実行する変更がありません。")
+        self.exec_btn.clicked.connect(self._on_execute)
+        self.cancel_btn.clicked.connect(self.reject)
+
+    @staticmethod
+    def _check_detail(check: CompileResult | None) -> str:
+        lines: list[str] = []
+        if check is None:
+            lines.append("文法チェックは実施されていません。")
+        else:
+            lines.append(f"結果: {check.summary()}")
+            if check.compiler:
+                lines.append(f"コンパイラ: {check.compiler}")
+            if check.status == STATUS_UNAVAILABLE:
+                lines.append(f"チェックできなかった理由: {check.reason}")
+            for d in check.diagnostics:
+                where = f"{d.line} 行 {d.col} 桁" if d.in_script else f"定義の生成に起因（ラッパー {d.line} 行）"
+                lines.append(f"  {d.kind_label}  {d.code}  {where}  {d.message}")
+        lines.append("")
+        lines.append(COMPILE_NOTICE)
+        return "\n".join(lines)
+
+    def _on_execute(self) -> None:
+        if self._running or self.database is None:
+            return
+        conn = self.config_manager.config.connection
+        answer = QMessageBox.question(
+            self, "実行の確認",
+            f"{self.change.label}\n\n接続先 サーバー {conn.server} / データベース {conn.database} の "
+            "SCRIPT にスクリプトを書き込みます。実行しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._running = True
+        self.exec_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
+        self.tabs.setEnabled(False)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        self.status_label.setText("実行中…")
+
+        self._executor = ScriptChangeExecutor(
+            self.change, self.database, self.config_manager.config.updated_by,
+            self.config_manager.backup_dir, self.config_manager.log_dir,
+        )
+        self._executor.finished.connect(self._on_finished)
+        self._handle = worker.start_worker(self._executor, self._executor.run,
+                                           [self._executor.finished])
+
+    @Slot(object)
+    def _on_finished(self, result: ExecutionResult) -> None:
+        self._running = False
+        self._executor = None
+        self.execution_result = result
+        self.progress.setVisible(False)
+        if result.success:
+            self.status_label.setText("完了しました。")
+            backup = os.path.basename(result.backup_json) if result.backup_json else "-"
+            QMessageBox.information(self, "保存完了", f"{result.message}\n\n退避ファイル: {backup}")
             self.accept()
             return
         self.status_label.setText("失敗しました。")

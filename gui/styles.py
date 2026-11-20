@@ -55,6 +55,11 @@ COLORS = {
     "code_line_number_bg": "#e8eef4",  # コード: 行番号エリア背景
     "code_line_number_text": "#666666",  # コード: 行番号文字
     "splitter_handle": "#d6dee6",      # スプリッターの境界
+    # --- 変更指示002: 文法チェック ---
+    "code_error_line": "#fde2df",      # コード: エラーのある行の背景
+    "code_error_marker": "#e74c3c",    # コード: 行番号エリアのエラーの印
+    "code_warning_line": "#fff3d6",    # コード: 警告のある行の背景
+    "code_warning_marker": "#f39c12",  # コード: 行番号エリアの警告の印
 }
 
 # フォント定数
@@ -524,6 +529,59 @@ QScrollArea#overviewArea {{
 }}
 QWidget#overviewContent {{
     background-color: {c["bg_panel"]};
+}}
+
+/* ================= スクリプトの編集・文法チェック（変更指示002） ================= */
+QLabel#checkStatus {{
+    color: {c["text_secondary"]};
+    padding: 0 6px;
+}}
+QLabel#checkStatus[state="ok"] {{
+    color: {c["success"]};
+    font-weight: bold;
+}}
+QLabel#checkStatus[state="error"] {{
+    color: {c["error"]};
+    font-weight: bold;
+}}
+QLabel#checkStatus[state="unavailable"] {{
+    color: {c["warning"]};
+    font-weight: bold;
+}}
+QLabel#checkStatus[state="running"] {{
+    color: {c["accent"]};
+}}
+QWidget#compileErrorPanel {{
+    background-color: {c["bg_panel"]};
+    border: 1px solid {c["border"]};
+}}
+QLabel#compileNotice {{
+    color: {c["text_secondary"]};
+    padding: 2px 6px;
+}}
+QLabel#compileSummary {{
+    padding: 2px 6px;
+}}
+QLabel#compileSummary[state="ok"] {{
+    color: {c["success"]};
+    font-weight: bold;
+}}
+QLabel#compileSummary[state="error"] {{
+    color: {c["error"]};
+    font-weight: bold;
+}}
+QLabel#compileSummary[state="unavailable"] {{
+    color: {c["warning"]};
+    font-weight: bold;
+}}
+/* 書き込み先を取り違えないよう、プレビューの接続先は目立たせる */
+QLabel#connectionBanner {{
+    background-color: {c["header_bg"]};
+    color: {c["header_text"]};
+    font-size: 11pt;
+    font-weight: bold;
+    padding: 6px 10px;
+    border-radius: 3px;
 }}
 """
 
