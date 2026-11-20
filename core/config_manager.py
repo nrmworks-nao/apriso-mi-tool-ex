@@ -87,6 +87,9 @@ class WindowConfig:
     group_by_equipment: bool = False
     # 表の列幅（ヘッダー状態）。キーは表の識別名（例: "point_tab"）
     table_headers: dict = field(default_factory=dict)
+    # スクリプトタブの詳細サイドバー（メインウィンドウのみ。別ウィンドウの状態は保存しない）
+    script_sidebar_visible: bool = True
+    script_sidebar_width: int = 320
 
 
 @dataclass
@@ -130,6 +133,8 @@ class AppConfig:
             cfg.connection.timeout_seconds = 15
         if cfg.viewer.font_size <= 0:
             cfg.viewer.font_size = 10
+        if cfg.window.script_sidebar_width <= 0:
+            cfg.window.script_sidebar_width = 320
         cfg.window.table_headers = {
             str(k): v for k, v in cfg.window.table_headers.items() if isinstance(v, str)
         }

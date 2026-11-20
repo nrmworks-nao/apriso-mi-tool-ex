@@ -227,6 +227,14 @@ class MainWindow(QMainWindow):
         self.act_about = QAction("バージョン情報", self)
         self.act_about.triggered.connect(self._show_about)
 
+        # スクリプトタブの詳細サイドバー（ボタン・メニュー・ショートカットの状態を一致させる）
+        self.act_script_sidebar = QAction("スクリプト詳細サイドバー", self)
+        self.act_script_sidebar.setCheckable(True)
+        self.act_script_sidebar.setChecked(True)
+        self.act_script_sidebar.setShortcut(QKeySequence("Ctrl+Alt+B"))
+        self.act_script_sidebar.toggled.connect(
+            lambda checked: self.script_tab.set_sidebar_visible(checked))
+
         # ツールバー
         self.act_edit_mode = QAction("編集モード", self)
         self.act_edit_mode.setCheckable(True)
@@ -258,6 +266,7 @@ class MainWindow(QMainWindow):
         m_view.addAction(self.act_script_compare)
         m_view.addSeparator()
         m_view.addAction(self.act_group_by_equipment)
+        m_view.addAction(self.act_script_sidebar)
 
         m_tool = mb.addMenu("ツール(&T)")
         m_check = m_tool.addMenu("チェック")
@@ -333,6 +342,7 @@ class MainWindow(QMainWindow):
 
         self.script_tab.open_window_requested.connect(self._open_script_window)
         self.script_tab.compare_requested.connect(self._open_similar_compare)
+        self.script_tab.sidebar_toggled.connect(self._on_script_sidebar_toggled)
         self._set_visible_tabs([TAB_OVERVIEW])
         self.overview.set_items("Apriso MI設定ツール", [("状態", "データが読み込まれていません。")])
 
@@ -371,11 +381,24 @@ class MainWindow(QMainWindow):
                 self.splitter.restoreState(_from_b64(w.splitter))
             except Exception:
                 logger.warning("スプリッター位置の復元に失敗しました")
+        # スクリプトタブの詳細サイドバー
+        self.script_tab.set_sidebar_width(w.script_sidebar_width)
+        self.script_tab.set_sidebar_visible(w.script_sidebar_visible)
+        self._on_script_sidebar_toggled(self.script_tab.is_sidebar_visible())
+
+    def _on_script_sidebar_toggled(self, visible: bool) -> None:
+        """スクリプトタブ側で切り替えたときに、メニュー項目のチェック状態を合わせる。"""
+        if self.act_script_sidebar.isChecked() != visible:
+            self.act_script_sidebar.blockSignals(True)
+            self.act_script_sidebar.setChecked(visible)
+            self.act_script_sidebar.blockSignals(False)
 
     def _save_window_state(self) -> None:
         w = self.config.window
         w.geometry = _b64(self.saveGeometry())
         w.splitter = _b64(self.splitter.saveState())
+        w.script_sidebar_visible = self.script_tab.is_sidebar_visible()
+        w.script_sidebar_width = self.script_tab.sidebar_width()
         self.point_tab.save_header()
         self.datasource_tab.save_header()
         if self._all_points_view is not None:
@@ -1156,7 +1179,7 @@ class MainWindow(QMainWindow):
         if a is None or s is None:
             return
         g = snap.action_groups.get(a.action_group_id)
-        win = ScriptWindow(self.config_manager, g.name if g else "?", a.name, s.source)
+        win = ScriptWindow(self.config_manager, g.name if g else "?", a.name, s.source, script=s)
         self._script_windows.append(win)
         win.destroyed.connect(lambda *args, w=win: self._forget_script_window(w))
         win.show()

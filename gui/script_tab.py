@@ -1,8 +1,9 @@
 """スクリプトタブ（閲覧のみ）
 
 - `<Source>` の内容を読み取り専用のコードビューアで表示する。
-- 下部の折りたたみパネルに、入力変数（標準5変数は薄く表示）、呼び出しオペレーション、
-  作成者・最終更新者・最終更新日時（JST）を表示する。
+- コードビューアの右側の詳細サイドバーに、入力変数（標準5変数は薄く表示）、
+  呼び出しオペレーション、作成者・最終更新者・最終更新日時（JST）を縦に並べて表示する。
+  サイドバーは見出しバーの「詳細」ボタン（Ctrl+Alt+B）で表示／非表示を切り替える。
 - 「別ウィンドウで開く」で、スクリプトだけの独立ウィンドウ（最大化可能）を開く。
 - 「ファイルに保存」で .cs（UTF-8、改行 CRLF）として保存する。
 
@@ -14,8 +15,8 @@ from __future__ import annotations
 import os
 import re
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -85,17 +87,22 @@ class CollapsibleSection(QWidget):
 
 
 class ScriptInfoPanel(QWidget):
-    """入力変数・呼び出しオペレーション・作成者等の表示。"""
+    """詳細サイドバー（入力変数・呼び出しオペレーション・更新情報を縦に並べる）。
+
+    各セクションは CollapsibleSection で個別に折りたためる。
+    入力変数の表が残りの高さを使い切る（折りたたんだときは末尾の余白が伸びる）。
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        lay = QHBoxLayout(self)
+        self.setObjectName("scriptSidebar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
-        lay.setSpacing(8)
+        lay.setSpacing(4)
+        self._lay = lay
 
         # 入力変数
-        left = QVBoxLayout()
-        left.addWidget(QLabel("入力変数", self))
         self.inputs_table = QTableWidget(0, 2, self)
         self.inputs_table.setHorizontalHeaderLabels(["名前", "型"])
         self.inputs_table.verticalHeader().setVisible(False)
@@ -103,43 +110,49 @@ class ScriptInfoPanel(QWidget):
         self.inputs_table.setAlternatingRowColors(True)
         self.inputs_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.inputs_table.horizontalHeader().setStretchLastSection(True)
-        self.inputs_table.setColumnWidth(0, 200)
-        left.addWidget(self.inputs_table)
-        lay.addLayout(left, 3)
+        self.inputs_table.setColumnWidth(0, 150)
+        self.inputs_section = CollapsibleSection("入力変数", self.inputs_table, expanded=True,
+                                                 parent=self)
+        lay.addWidget(self.inputs_section, 1)
 
         # 呼び出しオペレーション
-        mid = QVBoxLayout()
-        mid.addWidget(QLabel("呼び出しオペレーション", self))
         self.ops_list = QListWidget(self)
-        mid.addWidget(self.ops_list)
-        lay.addLayout(mid, 2)
+        self.ops_section = CollapsibleSection("呼び出しオペレーション", self.ops_list,
+                                              expanded=True, parent=self)
+        lay.addWidget(self.ops_section, 0)
 
-        # 作成者等
-        right = QVBoxLayout()
-        right.addWidget(QLabel("更新情報", self))
+        # 更新情報
         form_host = QWidget(self)
         form = QFormLayout(form_host)
-        form.setContentsMargins(0, 0, 0, 0)
+        form.setContentsMargins(4, 4, 4, 4)
+        # 幅が狭くても崩れないよう、長い行は項目名の下に値を折り返す
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         self.author_label = QLabel("", form_host)
         self.updated_by_label = QLabel("", form_host)
         self.updated_on_label = QLabel("", form_host)
         self.language_label = QLabel("", form_host)
         self.usings_label = QLabel("", form_host)
-        self.usings_label.setWordWrap(True)
         for lbl in (self.author_label, self.updated_by_label, self.updated_on_label,
                     self.language_label, self.usings_label):
+            lbl.setWordWrap(True)
             lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         form.addRow("作成者:", self.author_label)
         form.addRow("最終更新者:", self.updated_by_label)
         form.addRow("最終更新日時 (JST):", self.updated_on_label)
         form.addRow("言語:", self.language_label)
         form.addRow("using:", self.usings_label)
-        right.addWidget(form_host)
-        right.addStretch(1)
-        lay.addLayout(right, 2)
+        self.info_section = CollapsibleSection("更新情報", form_host, expanded=True, parent=self)
+        lay.addWidget(self.info_section, 0)
 
-        self.setMinimumHeight(150)
-        self.setMaximumHeight(240)
+        # 入力変数を折りたたんだときに残りの高さを受け持つ余白
+        lay.addStretch(0)
+        self._stretch_index = lay.count() - 1
+        self.inputs_section.button.toggled.connect(self._update_stretch)
+        self._update_stretch(self.inputs_section.button.isChecked())
+
+    def _update_stretch(self, inputs_expanded: bool) -> None:
+        self._lay.setStretch(0, 1 if inputs_expanded else 0)
+        self._lay.setStretch(self._stretch_index, 0 if inputs_expanded else 1)
 
     def clear(self) -> None:
         self.inputs_table.setRowCount(0)
@@ -171,11 +184,114 @@ class ScriptInfoPanel(QWidget):
         self.usings_label.setText(ps.usings)
 
 
+SIDEBAR_DEFAULT_WIDTH = 320
+SIDEBAR_MIN_WIDTH = 220
+SIDEBAR_SHORTCUT = "Ctrl+Alt+B"
+
+
+class ScriptCodeArea(QWidget):
+    """コードビューア（左）と詳細サイドバー（右）を水平の QSplitter に並べる。
+
+    - ウィンドウ幅を変えたときはコードビューア側だけが伸び縮みする。
+    - サイドバーはスプリッターで幅 0 まで潰せない。非表示は set_sidebar_visible() で行い、
+      再表示すると非表示にする前の幅に戻る。
+    """
+
+    sidebar_visibility_changed = Signal(bool)
+
+    def __init__(self, font_family: str, font_size: int, word_wrap: bool,
+                 sidebar_visible: bool = True, sidebar_width: int = SIDEBAR_DEFAULT_WIDTH,
+                 parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.panel = CodeViewerPanel(self.splitter, font_family=font_family,
+                                     font_size=font_size, word_wrap=word_wrap)
+        self.info = ScriptInfoPanel(self.splitter)
+        self.info.setMinimumWidth(SIDEBAR_MIN_WIDTH)
+        self.splitter.addWidget(self.panel)
+        self.splitter.addWidget(self.info)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 0)
+        self.splitter.setCollapsible(1, False)
+        lay.addWidget(self.splitter, 1)
+
+        self._sidebar_width = max(SIDEBAR_MIN_WIDTH, int(sidebar_width or SIDEBAR_DEFAULT_WIDTH))
+        self._width_pending = True   # 表示されたときにサイドバーの幅を適用する
+        self.info.setVisible(sidebar_visible)
+        self.splitter.splitterMoved.connect(self._on_splitter_moved)
+
+    # --- 状態 ----------------------------------------------------------
+    def is_sidebar_visible(self) -> bool:
+        # タブ自体が非表示でも判定できるよう、明示的に隠したかどうかで判定する
+        return not self.info.isHidden()
+
+    def set_sidebar_visible(self, visible: bool) -> None:
+        if visible == self.is_sidebar_visible():
+            return
+        if visible:
+            self.info.show()
+            self._width_pending = True
+            self._apply_width()
+        else:
+            self._remember_width()
+            self.info.hide()
+        self.sidebar_visibility_changed.emit(visible)
+
+    def sidebar_width(self) -> int:
+        """サイドバーの幅（非表示中は非表示にする前の幅）。"""
+        if self.is_sidebar_visible() and not self._width_pending:
+            self._remember_width()
+        return self._sidebar_width
+
+    def set_sidebar_width(self, width: int) -> None:
+        self._sidebar_width = max(SIDEBAR_MIN_WIDTH, int(width or SIDEBAR_DEFAULT_WIDTH))
+        self._width_pending = True
+        self._apply_width()
+
+    # --- 幅の管理 --------------------------------------------------------
+    def _on_splitter_moved(self, pos: int, index: int) -> None:
+        self._remember_width()
+
+    def _remember_width(self) -> None:
+        sizes = self.splitter.sizes()
+        if len(sizes) == 2 and sizes[1] > 0 and self.splitter.width() > 0:
+            self._sidebar_width = max(SIDEBAR_MIN_WIDTH, sizes[1])
+
+    def _apply_width(self) -> None:
+        if not self._width_pending or not self.is_sidebar_visible() or not self.isVisible():
+            return
+        total = sum(self.splitter.sizes())
+        if total <= 0 or self.splitter.width() <= 0:
+            return
+        width = min(self._sidebar_width, max(SIDEBAR_MIN_WIDTH, total - 100))
+        self.splitter.setSizes([max(0, total - width), width])
+        self._width_pending = False
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # レイアウトが確定してから幅を適用する
+        QTimer.singleShot(0, self._apply_width)
+
+
+def make_sidebar_toggle_button(parent: QWidget) -> QPushButton:
+    """見出しバー右端の「詳細」切り替えボタン（押されている状態 = 表示中）。"""
+    btn = QPushButton("詳細", parent)
+    btn.setObjectName("sidebarToggle")
+    btn.setCheckable(True)
+    btn.setToolTip(f"スクリプト詳細サイドバーの表示／非表示 ({SIDEBAR_SHORTCUT})")
+    return btn
+
+
 class ScriptTab(QWidget):
     """スクリプトタブ。"""
 
     open_window_requested = Signal(int)   # action_id
     compare_requested = Signal(int)       # action_id
+    sidebar_toggled = Signal(bool)        # 詳細サイドバーの表示状態が変わった
 
     def __init__(self, config_manager: ConfigManager, parent=None):
         super().__init__(parent)
@@ -209,21 +325,26 @@ class ScriptTab(QWidget):
         bar_lay.addWidget(self.save_btn)
         self.compare_btn = QPushButton("同種グループと比較…", bar)
         bar_lay.addWidget(self.compare_btn)
+        self.sidebar_btn = make_sidebar_toggle_button(bar)
+        bar_lay.addWidget(self.sidebar_btn)
         lay.addWidget(bar)
 
         self.message_label = QLabel("", self)
         self.message_label.setObjectName("secondaryLabel")
         lay.addWidget(self.message_label)
 
-        self.panel = CodeViewerPanel(self, font_family=vcfg.font_family,
-                                     font_size=vcfg.font_size, word_wrap=vcfg.word_wrap)
-        lay.addWidget(self.panel, 1)
+        # コードビューア（左）+ 詳細サイドバー（右）
+        # ショートカット Ctrl+Alt+B はメインウィンドウの表示メニューの項目が受け持つ
+        self.area = ScriptCodeArea(vcfg.font_family, vcfg.font_size, vcfg.word_wrap,
+                                   sidebar_visible=True, sidebar_width=SIDEBAR_DEFAULT_WIDTH,
+                                   parent=self)
+        self.panel = self.area.panel
+        self.info = self.area.info
+        lay.addWidget(self.area, 1)
+        self.sidebar_btn.setChecked(self.area.is_sidebar_visible())
 
-        self.info = ScriptInfoPanel(self)
-        self.section = CollapsibleSection("詳細（入力変数・呼び出しオペレーション・更新情報）",
-                                          self.info, expanded=True, parent=self)
-        lay.addWidget(self.section)
-
+        self.sidebar_btn.toggled.connect(self.set_sidebar_visible)
+        self.area.sidebar_visibility_changed.connect(self._on_sidebar_visibility_changed)
         self.window_btn.clicked.connect(self._on_open_window)
         self.save_btn.clicked.connect(self._on_save)
         self.compare_btn.clicked.connect(self._on_compare)
@@ -290,6 +411,34 @@ class ScriptTab(QWidget):
     def goto_line(self, line: int) -> None:
         self.panel.viewer.goto_line(line)
 
+    # --- 詳細サイドバー --------------------------------------------------
+    def is_sidebar_visible(self) -> bool:
+        return self.area.is_sidebar_visible()
+
+    def set_sidebar_visible(self, visible: bool) -> None:
+        self.area.set_sidebar_visible(bool(visible))
+        self._sync_sidebar_button()
+
+    def toggle_sidebar(self) -> None:
+        self.set_sidebar_visible(not self.is_sidebar_visible())
+
+    def sidebar_width(self) -> int:
+        return self.area.sidebar_width()
+
+    def set_sidebar_width(self, width: int) -> None:
+        self.area.set_sidebar_width(width)
+
+    def _sync_sidebar_button(self) -> None:
+        visible = self.area.is_sidebar_visible()
+        if self.sidebar_btn.isChecked() != visible:
+            self.sidebar_btn.blockSignals(True)
+            self.sidebar_btn.setChecked(visible)
+            self.sidebar_btn.blockSignals(False)
+
+    def _on_sidebar_visibility_changed(self, visible: bool) -> None:
+        self._sync_sidebar_button()
+        self.sidebar_toggled.emit(visible)
+
     def _update_buttons(self) -> None:
         has_script = self._script is not None
         self.window_btn.setEnabled(has_script)
@@ -336,10 +485,14 @@ def save_script_dialog(parent: QWidget, config_manager: ConfigManager, group_nam
 
 
 class ScriptWindow(QMainWindow):
-    """スクリプトだけの独立ウィンドウ（複数同時に開ける）。"""
+    """スクリプトだけの独立ウィンドウ（複数同時に開ける）。
+
+    詳細サイドバーの初期状態は非表示（コードを広く見るためのウィンドウのため）。
+    切り替えはこのウィンドウだけに作用し、設定には保存しない。
+    """
 
     def __init__(self, config_manager: ConfigManager, group_name: str, action_name: str,
-                 source: str, parent=None):
+                 source: str, parent=None, script: Script | None = None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle(f"{group_name} / {action_name}")
@@ -368,16 +521,39 @@ class ScriptWindow(QMainWindow):
         bar_lay.addWidget(wrap_cb)
         save_btn = QPushButton("ファイルに保存…", bar)
         bar_lay.addWidget(save_btn)
+        self.sidebar_btn = make_sidebar_toggle_button(bar)
+        bar_lay.addWidget(self.sidebar_btn)
         lay.addWidget(bar)
 
-        self.panel = CodeViewerPanel(central, font_family=vcfg.font_family,
-                                     font_size=vcfg.font_size, word_wrap=vcfg.word_wrap)
+        self.area = ScriptCodeArea(vcfg.font_family, vcfg.font_size, vcfg.word_wrap,
+                                   sidebar_visible=False, sidebar_width=SIDEBAR_DEFAULT_WIDTH,
+                                   parent=central)
+        self.panel = self.area.panel
         self.panel.set_code(source)
-        lay.addWidget(self.panel, 1)
+        if script is not None:
+            self.area.info.show_script(script)
+        lay.addWidget(self.area, 1)
         self.setCentralWidget(central)
+        self.sidebar_btn.setChecked(self.area.is_sidebar_visible())
+
+        # このウィンドウだけに作用するショートカット
+        self._sidebar_shortcut = QShortcut(QKeySequence(SIDEBAR_SHORTCUT), self)
+        self._sidebar_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self._sidebar_shortcut.activated.connect(self._toggle_sidebar)
 
         wrap_cb.toggled.connect(self.panel.viewer.set_word_wrap)
         save_btn.clicked.connect(self._on_save)
+        self.sidebar_btn.toggled.connect(self.area.set_sidebar_visible)
+        self.area.sidebar_visibility_changed.connect(self._sync_sidebar_button)
+
+    def _toggle_sidebar(self) -> None:
+        self.area.set_sidebar_visible(not self.area.is_sidebar_visible())
+
+    def _sync_sidebar_button(self, visible: bool) -> None:
+        if self.sidebar_btn.isChecked() != visible:
+            self.sidebar_btn.blockSignals(True)
+            self.sidebar_btn.setChecked(visible)
+            self.sidebar_btn.blockSignals(False)
 
     def _on_save(self) -> None:
         save_script_dialog(self, self._config_manager, self._group_name, self._action_name,

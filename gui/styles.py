@@ -181,6 +181,31 @@ QPushButton:disabled {{
     color: {c["button_disabled_text"]};
 }}
 
+/* ================= スクリプト詳細サイドバー ================= */
+QWidget#scriptSidebar {{
+    background-color: {c["bg_panel"]};
+    border: 1px solid {c["border"]};
+}}
+/* 「詳細」切り替えボタン: 非押下は控えめ、押下中（表示中）はアクセント色 */
+QWidget#panelToolBar QPushButton#sidebarToggle {{
+    background-color: {c["bg_panel"]};
+    color: {c["text_primary"]};
+    border: 1px solid {c["border"]};
+    padding: 4px 10px;
+}}
+QWidget#panelToolBar QPushButton#sidebarToggle:hover {{
+    background-color: {c["spin_button_hover"]};
+}}
+QWidget#panelToolBar QPushButton#sidebarToggle:checked {{
+    background-color: {c["accent"]};
+    color: {c["button_text"]};
+    border-color: {c["accent"]};
+}}
+QWidget#panelToolBar QPushButton#sidebarToggle:checked:hover {{
+    background-color: {c["accent_hover"]};
+    border-color: {c["accent_hover"]};
+}}
+
 /* ================= 折りたたみパネルの見出しボタン ================= */
 QToolButton#collapseButton {{
     background-color: {c["table_header_bg"]};
