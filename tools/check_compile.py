@@ -196,6 +196,42 @@ def load_from_db(database: str | None) -> list[tuple[str, str]]:
         return [(f"{row[0]} {row[1]}/{row[2]}", row[3]) for row in cur.fetchall()]
 
 
+def run_negative(csc: str, targets: list[tuple[str, str]]) -> int:
+    """正常なソースにわざと誤りを入れ、エラーとして検出されるかを確認する。"""
+    if not targets:
+        print("--negative で指定した対象が見つかりません。")
+        return 1
+    label, xml = targets[0]
+    parts = parse_parts(xml)
+    src = parts.source.replace("\r\n", "\n")
+    n_lines = src.count("\n") + 1
+    print(f"対象: {label}（{n_lines} 行）")
+
+    first_semi = src.index(";")
+    semi_line = src.count("\n", 0, first_semi) + 1
+    m = re.search(r"\bin\w+\s*:", src)
+    cases = [
+        (f"セミコロンを1つ削除（{semi_line} 行目）", src[:first_semi] + src[first_semi + 1:]),
+        (f"未定義の変数に代入（末尾 {n_lines + 1} 行目に追加）", src + "\nundefinedVariable = 1;"),
+        (f"型の不一致（末尾 {n_lines + 1} 行目に追加）", src + '\nint __x = "abc";'),
+        (f"入力変数の型違い（末尾 {n_lines + 1} 行目に追加）", src + "\nMachineConnectorName = 123;"),
+    ]
+    if m:
+        arg_line = src.count("\n", 0, m.start()) + 1
+        cases.append((f"オペレーションの引数名を誤記（{arg_line} 行目）",
+                      src[:m.start()] + m.group(0).replace(":", "X:") + src[m.end():]))
+    cases.append(("誤りなし（対照）", src))
+
+    for title, mutated in cases:
+        diags, raw = compile_check(csc, build_wrapper(dataclasses.replace(parts, source=mutated)))
+        errors = [d for d in diags if d.kind == "error"]
+        print(f"\n[{title}] → エラー {len(errors)} 件")
+        for d in errors[:3]:
+            where = f"スクリプト {d.line}行 {d.col}桁" if d.in_script else f"ラッパー {d.line}行"
+            print(f"    {d.code} [{where}] {d.message}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="MI スクリプトのコンパイルチェック（試作）")
     ap.add_argument("--all", action="store_true", help="DB の全スクリプトを検査する")
@@ -203,6 +239,7 @@ def main() -> int:
     ap.add_argument("--file", action="append", default=[], help="検査する XML ファイル")
     ap.add_argument("--show-wrapper", help="指定した SCRIPT.ID（またはファイル名の一部）のラッパーを表示")
     ap.add_argument("--csc", help="使用する csc.exe のパス")
+    ap.add_argument("--negative", help="指定した SCRIPT.ID のソースにわざと誤りを入れ、検出できるかを試す")
     args = ap.parse_args()
 
     compilers = [args.csc] if args.csc else find_compilers()
@@ -213,7 +250,7 @@ def main() -> int:
         print("csc.exe が見つかりません。")
         return 1
     csc = compilers[0]
-    ver = subprocess.run([csc, "/?"], capture_output=True).stdout.decode("utf-8", errors="replace")
+    ver = subprocess.run([csc, "/?"], capture_output=True).stdout.decode("mbcs" if os.name == "nt" else "utf-8", errors="replace")
     print("使用: " + csc)
     print("  " + (ver.splitlines()[0] if ver else ""))
 
@@ -226,6 +263,9 @@ def main() -> int:
     if not targets:
         print("検査対象がありません（--all または --file を指定）。")
         return 1
+
+    if args.negative:
+        return run_negative(csc, [t for t in targets if args.negative in t[0]])
 
     ok = ng = 0
     code_counts: dict[str, int] = {}
