@@ -130,7 +130,6 @@ QToolBar#toolBar {{
     border: none;
     border-bottom: 1px solid {c["border"]};
     padding: 4px 6px;
-    spacing: 6px;
 }}
 QToolBar#toolBar QToolButton {{
     background-color: {c["button_bg"]};
@@ -138,6 +137,7 @@ QToolBar#toolBar QToolButton {{
     border: none;
     border-radius: 2px;
     padding: 5px 14px;
+    margin-right: 4px;
 }}
 QToolBar#toolBar QToolButton:hover {{
     background-color: {c["button_hover"]};
