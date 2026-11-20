@@ -1,0 +1,12 @@
+.venv/
+build/
+dist/
+__pycache__/
+*.py[cod]
+*.pyo
+config.json
+log/
+*.log
+backup/
+.vscode/
+.idea/
